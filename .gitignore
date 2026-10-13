@@ -1,0 +1,35 @@
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Model weights and checkpoints (>100MB exceeds GitHub limits)
+*.pt
+*.pth
+*.bin
+*.ckpt
+best3.pt
+
+# Temporary audio, logs & runtime caches
+tmpdir_spkrec/
+temp_audio.wav
+*.log
+*.err
+slurm_*.log
+slurm_*.err
+
+# OS generated files
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Editor / IDE configurations
+.idea/
+.vscode/
