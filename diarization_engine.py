@@ -76,6 +76,98 @@ class SpeakerManager:
             }
             return new_id, (highest_sim if highest_sim != -1.0 else 1.0), True
 
+
+class StreamingVADSegmenter:
+    """Incremental Silero VAD segmenter. Feed mono float32 audio sampled at 16 kHz."""
+    def __init__(
+        self,
+        vad_model,
+        threshold: float = VAD_THRESHOLD,
+        silence_duration: float = SILENCE_DURATION,
+        min_speech_duration: float = MIN_SPEECH_DURATION,
+    ):
+        self.vad_model = vad_model
+        self.threshold = float(threshold)
+        self.silence_limit_frames = max(1, int(silence_duration * SAMPLE_RATE / CHUNK_SIZE))
+        self.min_speech_frames = max(1, int(min_speech_duration * SAMPLE_RATE / CHUNK_SIZE))
+        self.reset()
+
+    def reset(self):
+        self.pending = np.empty(0, dtype=np.float32)
+        self.is_speaking = False
+        self.speech_chunks = []
+        self.silence_counter = 0
+        self.frame_idx = 0
+        self.current_start_frame = 0
+        self.vad_model.reset_states()
+
+    def _finalize(self, include_pending_silence: bool = False):
+        speech_frames_count = len(self.speech_chunks)
+        if not include_pending_silence:
+            speech_frames_count -= self.silence_counter
+        if speech_frames_count < self.min_speech_frames:
+            self.speech_chunks = []
+            self.silence_counter = 0
+            self.is_speaking = False
+            self.vad_model.reset_states()
+            return None
+
+        audio = torch.cat(self.speech_chunks[:speech_frames_count]).detach().cpu().float()
+        start_sec = self.current_start_frame * CHUNK_SIZE / SAMPLE_RATE
+        end_sec = start_sec + len(audio) / SAMPLE_RATE
+
+        self.speech_chunks = []
+        self.silence_counter = 0
+        self.is_speaking = False
+        self.vad_model.reset_states()
+        return audio, start_sec, end_sec
+
+    def push_audio(self, audio: np.ndarray):
+        """Return zero or more (audio_tensor, start_sec, end_sec) utterances."""
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size:
+            self.pending = np.concatenate((self.pending, audio))
+
+        completed = []
+        while self.pending.size >= CHUNK_SIZE:
+            chunk_np = self.pending[:CHUNK_SIZE]
+            self.pending = self.pending[CHUNK_SIZE:]
+            chunk = torch.from_numpy(chunk_np.copy())
+
+            with torch.no_grad():
+                probability = float(self.vad_model(chunk, SAMPLE_RATE).item())
+
+            if probability >= self.threshold:
+                if not self.is_speaking:
+                    self.is_speaking = True
+                    self.current_start_frame = self.frame_idx
+                self.speech_chunks.append(chunk)
+                self.silence_counter = 0
+            elif self.is_speaking:
+                self.speech_chunks.append(chunk)
+                self.silence_counter += 1
+                if self.silence_counter > self.silence_limit_frames:
+                    result = self._finalize()
+                    if result is not None:
+                        completed.append(result)
+
+            self.frame_idx += 1
+
+        return completed
+
+    def flush(self):
+        """Finalize speech still in progress when the user stops recording."""
+        completed = []
+        if self.pending.size:
+            padded = np.pad(self.pending, (0, CHUNK_SIZE - self.pending.size))
+            self.pending = np.empty(0, dtype=np.float32)
+            completed.extend(self.push_audio(padded))
+        if self.is_speaking:
+            result = self._finalize()
+            if result is not None:
+                completed.append(result)
+        return completed
+
 class DiarizationEngine:
     """Unified VAD & Speaker Diarization Engine for both batch audio files and live streams."""
     def __init__(self, vad_model, speaker_model):
@@ -103,6 +195,29 @@ class DiarizationEngine:
         speaker_model.eval()
 
         return cls(vad_model, speaker_model)
+
+
+    def process_utterance(
+        self,
+        audio_tensor: torch.Tensor,
+        turn_id: int,
+        start_sec: float,
+        end_sec: float,
+    ) -> DiarizedSegment:
+        """Assign a speaker to one already-segmented utterance while retaining speaker history."""
+        audio_tensor = audio_tensor.detach().float().cpu().flatten()
+        speaker_id, similarity, is_new = self.speaker_manager.identify_or_register(
+            audio_tensor, self.speaker_model
+        )
+        return DiarizedSegment(
+            turn_id=turn_id,
+            speaker_id=speaker_id,
+            start_sec=float(start_sec),
+            end_sec=float(end_sec),
+            audio=audio_tensor,
+            similarity=float(similarity),
+            is_new_speaker=bool(is_new),
+        )
 
     def process_full_audio(self, audio_data: np.ndarray, sample_rate: int = SAMPLE_RATE) -> List[DiarizedSegment]:
         """
