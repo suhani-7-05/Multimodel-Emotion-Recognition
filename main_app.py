@@ -1,8 +1,6 @@
 import io
 import os
-import queue
 import logging
-import threading
 import warnings
 from collections import Counter
 
@@ -14,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import whisper
-from scipy.signal import resample_poly
 from transformers import BertTokenizer, BertModel
 
 try:
@@ -25,6 +22,13 @@ except Exception as exc:
     webrtc_streamer = None
     WEBRTC_IMPORT_ERROR = exc
 
+try:
+    import sounddevice  # noqa: F401  (only checking that PortAudio is usable)
+    SD_IMPORT_ERROR = None
+except Exception as exc:
+    SD_IMPORT_ERROR = exc
+
+from audio_capture import LiveSession, SoundDeviceSource, list_input_devices
 from diarization_engine import (
     DiarizationEngine,
     StreamingVADSegmenter,
@@ -163,51 +167,76 @@ def analyze_utterance(audio_tensor, turn_id, start_sec, end_sec,
     return segment
 
 
-def inference_worker(work_queue, result_queue, diarizer, whisper_model,
-                     emotion_model, tokenizer):
-    """Never touches Streamlit UI; recording can continue while this worker infers."""
-    while True:
-        item = work_queue.get()
-        try:
-            if item is None:
-                return
-            audio, start_sec, end_sec, turn_id = item
-            result = analyze_utterance(
-                audio, turn_id, start_sec, end_sec, diarizer,
-                whisper_model, emotion_model, tokenizer,
+
+DEBUG_WAV_PATH = "debug_capture_16k.wav"
+
+
+def segment_wav_bytes(seg):
+    """Encode a segment to WAV once; re-encoding every segment on every UI refresh was slow."""
+    cached = getattr(seg, "_wav_bytes", None)
+    if cached is None:
+        cached = audio_tensor_to_wav_bytes(seg.audio)
+        seg._wav_bytes = cached
+    return cached
+
+
+def collect_from_session(session):
+    """Move finished results/errors from the session's queues into st.session_state."""
+    got_something = False
+    for message in session.drain_results():
+        got_something = True
+        if message["ok"]:
+            st.session_state.live_results.append(message["segment"])
+        else:
+            st.session_state.live_errors.append(
+                f"Turn {message.get('turn_id')}: {message['error']}"
             )
-            result_queue.put({"ok": True, "segment": result})
-        except Exception as exc:
-            result_queue.put({
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "turn_id": item[3] if item else None,
-            })
-        finally:
-            work_queue.task_done()
+    for error in session.drain_errors():
+        got_something = True
+        st.session_state.live_errors.append(error)
+    return got_something
 
 
-def frame_to_16k_mono(frame):
-    """Convert a PyAV audio frame to mono float32 at 16 kHz."""
-    array = np.asarray(frame.to_ndarray())
-    if np.issubdtype(array.dtype, np.integer):
-        info = np.iinfo(array.dtype)
-        audio = array.astype(np.float32) / max(abs(info.min), info.max)
-    else:
-        audio = array.astype(np.float32)
-    if audio.ndim == 2:
-        # PyAV generally returns (channels, samples) for planar audio.
-        audio = audio.mean(axis=0)
+def stop_live_session():
+    session = st.session_state.live_session
+    if session is None:
+        return
+    with st.spinner("Finishing queued utterances..."):
+        session.stop()
+    collect_from_session(session)
+    st.session_state.live_session = None
 
-    source_rate = int(frame.sample_rate or SAMPLE_RATE)
-    if source_rate != SAMPLE_RATE and audio.size:
-        # Typical browser input is 48 kHz; polyphase resampling is fast and stable.
-        from math import gcd
-        divisor = gcd(source_rate, SAMPLE_RATE)
-        audio = resample_poly(
-            audio, SAMPLE_RATE // divisor, source_rate // divisor
-        ).astype(np.float32)
-    return np.clip(audio, -1.0, 1.0)
+
+def render_capture_health():
+    """Light fragment, refreshes every second while recording. Never re-renders the timeline."""
+    session = st.session_state.live_session
+    if session is None:
+        return
+    if collect_from_session(session):
+        st.rerun()                      # full rerun -> timeline below shows the new turns
+    if not session.running:
+        st.session_state.live_session = None
+        st.rerun()
+
+    snap = session.snapshot()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Captured audio", f"{snap['audio_sec']:.0f} s")
+    c2.metric("Input peak", f"{snap['peak']:.2f}")
+    c3.metric("Timeline gaps", f"{snap['gap_events']} ({snap['gap_ms']:.0f} ms)")
+    c4.metric("Utterances pending", snap["pending"])
+    info = st.session_state.get("live_source_info")
+    if info:
+        st.caption(f"Source: {info} -> 16 kHz mono")
+    if snap["clipped_samples"] > 0:
+        st.warning("Input is clipping (hard distortion). Lower the microphone gain / input volume.")
+    if snap.get("overflows", 0) or snap.get("dropped_blocks", 0):
+        st.warning("PortAudio dropped input blocks - the machine could not keep up with capture.")
+    if snap["gap_events"] > 0:
+        st.warning(
+            "Audio timeline gaps (dropped WebRTC packets or Opus silence suppression). "
+            "They are filled with silence, but glitchy speech means: use Local microphone mode."
+        )
+
 
 
 def render_results(container, results, errors):
@@ -222,6 +251,7 @@ def render_results(container, results, errors):
         )
         m1, m2, m3 = st.columns(3)
         m1.metric("Processed utterances", len(results))
+        known_speakers = {seg.speaker_id for seg in results if seg.speaker_id != "Unknown"}
         m2.metric("Speakers detected", len({seg.speaker_id for seg in results}))
         dominant = counts.most_common(1)[0][0] if counts else "—"
         m3.metric("Most frequent emotion", dominant.upper())
@@ -248,7 +278,7 @@ def render_results(container, results, errors):
                 with right:
                     with st.expander("Emotion scores"):
                         st.json(seg.emotion_distribution or {})
-                    st.audio(audio_tensor_to_wav_bytes(seg.audio), format="audio/wav")
+                    st.audio(segment_wav_bytes(seg), format="audio/wav")
 
         for error in errors[-5:]:
             st.error(error)
@@ -283,180 +313,163 @@ with live_tab:
     st.markdown(
         "1. Load models once. 2. Start the microphone. 3. Speak naturally. "
         "A turn is finalized after the configured silence interval; the next turn "
-        "can be recorded while the previous turn is being analyzed."
+        "keeps being captured while the previous one is analysed in the background."
     )
-    if WEBRTC_IMPORT_ERROR is not None:
-        st.error("Real-time microphone support is not installed.")
-        st.code("python -m pip install streamlit-webrtc av")
-        st.caption(f"Import detail: {WEBRTC_IMPORT_ERROR}")
+    for key, factory in (
+        ("live_models_ready", lambda: False),
+        ("live_results", list),
+        ("live_errors", list),
+        ("live_session", lambda: None),
+        ("live_source_info", lambda: ""),
+    ):
+        if key not in st.session_state:
+            st.session_state[key] = factory()
+
+    if st.button("Load models for live analysis", type="primary"):
+        st.session_state.live_models_ready = True
+
+    if not st.session_state.live_models_ready:
+        st.info("Load the models before starting the live microphone.")
     else:
-        if "live_models_ready" not in st.session_state:
+        try:
+            with st.spinner("Loading VAD, speaker, Whisper and emotion models..."):
+                live_diarizer = load_diarization_engine()
+                live_whisper = load_whisper_model()
+                live_emotion, live_tokenizer = load_emotion_model()
+            st.success("Models loaded.")
+            models_ok = True
+        except Exception as exc:
             st.session_state.live_models_ready = False
-        if "live_results" not in st.session_state:
-            st.session_state.live_results = []
-        if "live_errors" not in st.session_state:
-            st.session_state.live_errors = []
-        if "live_runtime" not in st.session_state:
-            st.session_state.live_runtime = None
+            st.error(f"Could not load models: {type(exc).__name__}: {exc}")
+            models_ok = False
 
-        if st.button("Load models for live analysis", type="primary"):
-            st.session_state.live_models_ready = True
-
-        if st.session_state.live_models_ready:
-            try:
-                with st.spinner("Loading VAD, speaker, Whisper and emotion models..."):
-                    live_diarizer = load_diarization_engine()
-                    live_whisper = load_whisper_model()
-                    live_emotion, live_tokenizer = load_emotion_model()
-                st.success("Models loaded. Start the microphone below.")
-            except Exception as exc:
-                st.session_state.live_models_ready = False
-                st.error(f"Could not load models: {type(exc).__name__}: {exc}")
-                live_diarizer = live_whisper = live_emotion = live_tokenizer = None
-
-            if st.session_state.live_models_ready:
+        if models_ok:
+            def make_live_session(pull, on_close=None, extra_stats=None, debug=False):
                 live_diarizer.speaker_manager.threshold = spk_sim_thresh
-                ctx = webrtc_streamer(
-                    key="prj4-live-microphone",
-                    mode=WebRtcMode.SENDONLY,
-                    audio_receiver_size=1024,
-                    media_stream_constraints={"video": False, "audio": True},
-                    async_processing=True,
+                live_diarizer.speaker_manager.reset()
+                segmenter = StreamingVADSegmenter(
+                    live_diarizer.vad_model,
+                    threshold=vad_thresh,
+                    silence_duration=silence_dur,
+                    min_speech_duration=min_speech_dur,
                 )
 
-                results_area = st.empty()
-                status_area = st.empty()
-
-                if ctx.state.playing and ctx.audio_receiver is not None:
-                    runtime = st.session_state.live_runtime
-                    if runtime is None or runtime.get("closed", False):
-                        live_diarizer.speaker_manager.reset()
-                        segmenter = StreamingVADSegmenter(
-                            live_diarizer.vad_model,
-                            threshold=vad_thresh,
-                            silence_duration=silence_dur,
-                            min_speech_duration=min_speech_dur,
-                        )
-                        work_queue = queue.Queue(maxsize=20)
-                        result_queue = queue.Queue()
-                        worker = threading.Thread(
-                            target=inference_worker,
-                            args=(
-                                work_queue, result_queue, live_diarizer,
-                                live_whisper, live_emotion, live_tokenizer,
-                            ),
-                            daemon=True,
-                        )
-                        worker.start()
-                        runtime = {
-                            "segmenter": segmenter,
-                            "work_queue": work_queue,
-                            "result_queue": result_queue,
-                            "worker": worker,
-                            "turn_id": 0,
-                            "queued": 0,
-                            "closed": False,
-                        }
-                        st.session_state.live_runtime = runtime
-
-                    status_area.info(
-                        "Microphone is live. Audio capture continues while the "
-                        "background worker transcribes and classifies earlier turns."
+                def analyze(audio, start_sec, end_sec, turn_id):
+                    return analyze_utterance(
+                        audio, turn_id, start_sec, end_sec,
+                        live_diarizer, live_whisper, live_emotion, live_tokenizer,
                     )
-                    try:
-                        while ctx.state.playing:
-                            try:
-                                frames = ctx.audio_receiver.get_frames(timeout=0.2)
-                            except queue.Empty:
-                                frames = []
 
-                            for frame in frames:
-                                audio_16k = frame_to_16k_mono(frame)
-                                utterances = runtime["segmenter"].push_audio(audio_16k)
-                                for audio, start_sec, end_sec in utterances:
-                                    runtime["turn_id"] += 1
-                                    item = (audio, start_sec, end_sec, runtime["turn_id"])
-                                    try:
-                                        runtime["work_queue"].put_nowait(item)
-                                        runtime["queued"] += 1
-                                    except queue.Full:
-                                        st.session_state.live_errors.append(
-                                            "Inference queue is full; one utterance was dropped. "
-                                            "Try a smaller Whisper model or faster hardware."
-                                        )
+                session = LiveSession(
+                    pull, segmenter, analyze,
+                    on_close=on_close, extra_stats=extra_stats,
+                    debug_wav_path=DEBUG_WAV_PATH if debug else None,
+                )
+                session.start()
+                return session
 
-                            updated = False
-                            while True:
-                                try:
-                                    message = runtime["result_queue"].get_nowait()
-                                except queue.Empty:
-                                    break
-                                updated = True
-                                if message["ok"]:
-                                    st.session_state.live_results.append(message["segment"])
-                                else:
-                                    st.session_state.live_errors.append(
-                                        f"Turn {message.get('turn_id')}: {message['error']}"
-                                    )
-                            if updated:
-                                render_results(
-                                    results_area,
-                                    st.session_state.live_results,
-                                    st.session_state.live_errors,
-                                )
-                    finally:
-                        # Finalize any utterance still in progress when capture stops.
-                        for audio, start_sec, end_sec in runtime["segmenter"].flush():
-                            runtime["turn_id"] += 1
-                            try:
-                                runtime["work_queue"].put(
-                                    (audio, start_sec, end_sec, runtime["turn_id"]),
-                                    timeout=1,
-                                )
-                            except queue.Full:
-                                st.session_state.live_errors.append(
-                                    "Final utterance could not be queued because the inference queue was full."
-                                )
-                        runtime["closed"] = True
+            active = st.session_state.live_session is not None
+            modes = ["Local microphone (recommended)", "Browser microphone (WebRTC)"]
+            mode = st.radio("Audio input", modes, horizontal=True, disabled=active,
+                            key="live_input_mode")
+            debug_dump = st.checkbox(
+                f"Save the captured 16 kHz audio to {DEBUG_WAV_PATH} (to check capture quality)",
+                disabled=active,
+            )
+
+            if mode == modes[0]:
+                # Same capture idea as the original live_speaker_tracker.py: straight from
+                # the sound card, no browser, no WebRTC, no Opus codec.
+                if SD_IMPORT_ERROR is not None:
+                    st.error("Local microphone support is not installed.")
+                    st.code("python -m pip install sounddevice av")
+                    st.caption(f"Import detail: {SD_IMPORT_ERROR}")
+                else:
+                    devices = list_input_devices()
+                    labels = ["System default"] + [d["label"] for d in devices]
+                    index_of = {d["label"]: d["index"] for d in devices}
+                    choice = st.selectbox("Input device", labels, disabled=active)
+                    b1, b2 = st.columns(2)
+                    start_clicked = b1.button("Start microphone", type="primary", disabled=active)
+                    stop_clicked = b2.button("Stop", disabled=not active)
+
+                    if start_clicked:
+                        source = None
                         try:
-                            runtime["work_queue"].put(None, timeout=1)
-                        except queue.Full:
-                            st.session_state.live_errors.append(
-                                "Could not signal the inference worker to stop cleanly."
+                            source = SoundDeviceSource(index_of.get(choice))
+                            source.start()
+                            st.session_state.live_session = make_live_session(
+                                source.pull, on_close=source.stop,
+                                extra_stats=source.stats, debug=debug_dump,
                             )
-                        runtime["worker"].join(timeout=8)
-                        while True:
-                            try:
-                                message = runtime["result_queue"].get_nowait()
-                            except queue.Empty:
-                                break
-                            if message["ok"]:
-                                st.session_state.live_results.append(message["segment"])
-                            else:
-                                st.session_state.live_errors.append(
-                                    f"Turn {message.get('turn_id')}: {message['error']}"
-                                )
-                        st.session_state.live_runtime = None
-                        render_results(
-                            results_area,
-                            st.session_state.live_results,
-                            st.session_state.live_errors,
-                        )
-                        status_area.info("Microphone stopped.")
-
-                elif st.session_state.live_results:
-                    render_results(
-                        st.empty(), st.session_state.live_results,
-                        st.session_state.live_errors,
+                            st.session_state.live_source_info = (
+                                f"{source.device_name} @ {source.rate} Hz"
+                            )
+                        except Exception as exc:
+                            if source is not None:
+                                source.stop()
+                            st.session_state.live_errors.append(
+                                f"Could not open microphone: {type(exc).__name__}: {exc}"
+                            )
+                        st.rerun()
+                    if stop_clicked:
+                        stop_live_session()
+                        st.rerun()
+            else:
+                if WEBRTC_IMPORT_ERROR is not None:
+                    st.error("Browser microphone support is not installed.")
+                    st.code("python -m pip install streamlit-webrtc av")
+                    st.caption(f"Import detail: {WEBRTC_IMPORT_ERROR}")
+                else:
+                    st.caption(
+                        "Browser audio travels through WebRTC and the lossy Opus codec. Use this "
+                        "only when the browser and this server are on different machines."
                     )
+                    ctx = webrtc_streamer(
+                        key="prj4-live-microphone",
+                        mode=WebRtcMode.SENDONLY,
+                        audio_receiver_size=2048,
+                        media_stream_constraints={
+                            "video": False,
+                            # The browser's default voice-call DSP (noise suppression, echo
+                            # cancellation, auto gain) mangles speech and flattens the
+                            # prosody the emotion model relies on. Turn it all off.
+                            "audio": {
+                                "echoCancellation": False,
+                                "noiseSuppression": False,
+                                "autoGainControl": False,
+                                "channelCount": 1,
+                            },
+                        },
+                        async_processing=True,
+                    )
+                    playing = bool(ctx.state.playing and ctx.audio_receiver is not None)
+                    if playing and st.session_state.live_session is None:
+                        receiver = ctx.audio_receiver
+                        st.session_state.live_session = make_live_session(
+                            lambda timeout: receiver.get_frames(timeout=timeout),
+                            debug=debug_dump,
+                        )
+                        st.session_state.live_source_info = "Browser (WebRTC/Opus 48 kHz)"
+                        st.rerun()
+                    elif not playing and st.session_state.live_session is not None:
+                        stop_live_session()
+                        st.rerun()
 
-                if st.button("Clear live results"):
-                    st.session_state.live_results = []
-                    st.session_state.live_errors = []
-                    st.session_state.live_runtime = None
-                    st.rerun()
-        else:
-            st.info("Load the models before starting the live microphone.")
+            # Capture-health strip: its own fragment, so refreshing it never touches the timeline.
+            st.fragment(
+                render_capture_health,
+                run_every=1.0 if st.session_state.live_session is not None else None,
+            )()
+
+    render_results(
+        st.container(), st.session_state.live_results, st.session_state.live_errors
+    )
+    if st.button("Clear live results"):
+        st.session_state.live_results = []
+        st.session_state.live_errors = []
+        st.rerun()
+
 
 with batch_tab:
     st.markdown("Upload a WAV conversation for the original whole-file workflow.")
