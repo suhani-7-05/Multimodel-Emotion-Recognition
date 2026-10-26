@@ -99,7 +99,7 @@ def load_emotion_model():
 
 @st.cache_resource
 def load_whisper_model():
-    return whisper.load_model("base", device=DEVICE)
+    return whisper.load_model("large", device=DEVICE)
 
 
 @st.cache_resource
