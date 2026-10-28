@@ -2,6 +2,8 @@ import io
 import os
 import logging
 import warnings
+import sys
+from pathlib import Path
 from collections import Counter
 
 import librosa
@@ -9,10 +11,7 @@ import numpy as np
 import soundfile as sf
 import streamlit as st
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import whisper
-from transformers import BertTokenizer, BertModel
 
 try:
     from streamlit_webrtc import WebRtcMode, webrtc_streamer
@@ -35,66 +34,43 @@ from diarization_engine import (
     DiarizedSegment,
 )
 
+# New trained multimodal model bundle. Keep its common2.py isolated from old code.
+MODEL_BUNDLE_DIR = Path(__file__).resolve().parent / "model_bundle"
+MODEL_CHECKPOINT_DIR = MODEL_BUNDLE_DIR / "runs" / "v2_rl_audio"
+if not MODEL_CHECKPOINT_DIR.is_dir():
+    raise FileNotFoundError(
+        f"New emotion model directory not found: {MODEL_CHECKPOINT_DIR}. "
+        "Extract prj4_emotion_model.tar.gz into model_bundle first."
+    )
+sys.path.insert(0, str(MODEL_BUNDLE_DIR))
+from infer2 import EmotionContextEngine
+
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 logging.getLogger("transformers").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-TARGET = ["neutral", "joy", "anger", "sadness", "surprise"]
+TARGET = ["neutral", "joy", "surprise", "anger", "sadness", "disgust", "fear"]
 EMOTION_EMOJIS = {
-    "neutral": "😐", "joy": "😊", "anger": "😠",
-    "sadness": "😢", "surprise": "😲",
+    "neutral": "😐", "joy": "😊", "surprise": "😲",
+    "anger": "😠", "sadness": "😢", "disgust": "🤢", "fear": "😨",
 }
 EMOTION_COLORS = {
-    "neutral": "#6c757d", "joy": "#28a745", "anger": "#dc3545",
-    "sadness": "#17a2b8", "surprise": "#fd7e14",
+    "neutral": "#6c757d", "joy": "#28a745", "surprise": "#fd7e14",
+    "anger": "#dc3545", "sadness": "#17a2b8", "disgust": "#795548",
+    "fear": "#6f42c1",
 }
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAMPLE_RATE = 16000
 
 
-class Model(nn.Module):
-    """PRJ3 BERT + MFCC gated-fusion baseline used by the existing PRJ4 app."""
-    def __init__(self):
-        super().__init__()
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
-        self.t_proj = nn.Linear(768, 128)
-        self.a_proj = nn.Linear(15, 128)
-        self.w_t = nn.Linear(128, 1)
-        self.w_a = nn.Linear(128, 1)
-        self.fc = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 5),
-        )
-
-    def forward(self, ids, mask, aud):
-        text_features = self.t_proj(
-            self.bert(input_ids=ids, attention_mask=mask).pooler_output
-        )
-        audio_features = self.a_proj(aud)
-        weights = torch.softmax(
-            torch.cat([self.w_t(text_features), self.w_a(audio_features)], dim=1),
-            dim=1,
-        )
-        fused = weights[:, 0:1] * text_features + weights[:, 1:2] * audio_features
-        return self.fc(fused)
-
-
 @st.cache_resource
 def load_emotion_model():
-    model = Model().to(DEVICE)
-    checkpoint_path = "best3.pt"
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            "best3.pt was not found in the project working directory. "
-            "Place the trained checkpoint beside main_app.py."
-        )
-    state_dict = torch.load(checkpoint_path, map_location=DEVICE)
-    model.load_state_dict(state_dict)
-    model.eval()
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    return model, tokenizer
+    """Load RoBERTa + WavLM on CPU to conserve the laptop's 6 GB VRAM."""
+    return EmotionContextEngine(
+        ckpt_dir=str(MODEL_CHECKPOINT_DIR),
+        device="cpu",
+        audio_fp16=False,
+    )
 
 
 @st.cache_resource
@@ -105,18 +81,6 @@ def load_whisper_model():
 @st.cache_resource
 def load_diarization_engine():
     return DiarizationEngine.load_models("tmpdir_spkrec")
-
-
-def extract_mfcc_features(y, sr=SAMPLE_RATE):
-    try:
-        y = np.asarray(y, dtype=np.float32).reshape(-1)
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13).mean(axis=1)
-        rms = librosa.feature.rms(y=y).mean()
-        features = np.concatenate([mfcc, [0.0, rms]])
-        features = (features - features.mean()) / (features.std() + 1e-6)
-        return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-    except Exception:
-        return torch.zeros((1, 15), dtype=torch.float32, device=DEVICE)
 
 
 def audio_tensor_to_wav_bytes(audio_tensor, sr=SAMPLE_RATE):
@@ -131,41 +95,30 @@ def audio_tensor_to_wav_bytes(audio_tensor, sr=SAMPLE_RATE):
 
 
 def analyze_utterance(audio_tensor, turn_id, start_sec, end_sec,
-                      diarizer, whisper_model, emotion_model, tokenizer):
-    """Runs the expensive inference stage; called only by the background worker."""
+                      diarizer, whisper_model, emotion_engine):
+    """Diarize, transcribe, then classify one completed utterance."""
     segment = diarizer.process_utterance(
         audio_tensor=audio_tensor,
         turn_id=turn_id,
         start_sec=start_sec,
         end_sec=end_sec,
     )
-    audio_np = segment.audio.detach().cpu().numpy().astype(np.float32)
+    audio_np = segment.audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
     transcription = whisper_model.transcribe(
         audio_np, fp16=(DEVICE.type == "cuda"), verbose=False
     )
     segment.transcript = transcription.get("text", "").strip() or "[No speech transcribed]"
 
-    encoded = tokenizer(
-        segment.transcript,
-        return_tensors="pt",
-        padding="max_length",
-        truncation=True,
-        max_length=128,
-    ).to(DEVICE)
-    audio_features = extract_mfcc_features(audio_np, sr=SAMPLE_RATE)
-
-    with torch.no_grad():
-        logits = emotion_model(encoded["input_ids"], encoded["attention_mask"], audio_features)
-        probabilities = F.softmax(logits, dim=1).squeeze().detach().cpu().numpy()
-
-    label_index = int(np.argmax(probabilities))
-    segment.emotion = TARGET[label_index]
-    segment.emotion_confidence = float(probabilities[label_index])
-    segment.emotion_distribution = {
-        TARGET[i]: float(probabilities[i]) for i in range(len(TARGET))
-    }
+    result = emotion_engine.update(
+        speaker=str(segment.speaker_id),
+        text=segment.transcript,
+        audio=audio_np,
+        commit=True,
+    )
+    segment.emotion = result["emotion"]
+    segment.emotion_confidence = float(result["confidence"])
+    segment.emotion_distribution = result["probs"]
     return segment
-
 
 
 DEBUG_WAV_PATH = "debug_capture_16k.wav"
@@ -332,10 +285,10 @@ with live_tab:
         st.info("Load the models before starting the live microphone.")
     else:
         try:
-            with st.spinner("Loading VAD, speaker, Whisper and emotion models..."):
+            with st.spinner("Loading VAD, speaker, Whisper and the new emotion model..."):
                 live_diarizer = load_diarization_engine()
                 live_whisper = load_whisper_model()
-                live_emotion, live_tokenizer = load_emotion_model()
+                live_emotion = load_emotion_model()
             st.success("Models loaded.")
             models_ok = True
         except Exception as exc:
@@ -347,6 +300,7 @@ with live_tab:
             def make_live_session(pull, on_close=None, extra_stats=None, debug=False):
                 live_diarizer.speaker_manager.threshold = spk_sim_thresh
                 live_diarizer.speaker_manager.reset()
+                live_emotion.reset()
                 segmenter = StreamingVADSegmenter(
                     live_diarizer.vad_model,
                     threshold=vad_thresh,
@@ -357,7 +311,7 @@ with live_tab:
                 def analyze(audio, start_sec, end_sec, turn_id):
                     return analyze_utterance(
                         audio, turn_id, start_sec, end_sec,
-                        live_diarizer, live_whisper, live_emotion, live_tokenizer,
+                        live_diarizer, live_whisper, live_emotion,
                     )
 
                 session = LiveSession(
@@ -488,10 +442,11 @@ with batch_tab:
                 with st.spinner("Loading models..."):
                     diarizer = load_diarization_engine()
                     whisper_model = load_whisper_model()
-                    emotion_model, tokenizer = load_emotion_model()
+                    emotion_engine = load_emotion_model()
 
                 diarizer.speaker_manager.threshold = spk_sim_thresh
                 diarizer.speaker_manager.reset()
+                emotion_engine.reset()
                 with st.spinner("Reading and segmenting audio..."):
                     audio, _ = librosa.load(uploaded_file, sr=SAMPLE_RATE, mono=True)
                     duration = len(audio) / SAMPLE_RATE
@@ -512,28 +467,16 @@ with batch_tab:
                                 verbose=False,
                             ).get("text", "").strip() or "[No speech transcribed]"
 
-                        encoded = tokenizer(
-                            segment.transcript,
-                            return_tensors="pt",
-                            padding="max_length",
-                            truncation=True,
-                            max_length=128,
-                        ).to(DEVICE)
-                        features = extract_mfcc_features(
-                            segment.audio.numpy(), sr=SAMPLE_RATE
+                        audio_np = segment.audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
+                        result = emotion_engine.update(
+                            speaker=str(segment.speaker_id),
+                            text=segment.transcript,
+                            audio=audio_np,
+                            commit=True,
                         )
-                        with torch.no_grad():
-                            logits = emotion_model(
-                                encoded["input_ids"], encoded["attention_mask"], features
-                            )
-                            probabilities = F.softmax(logits, dim=1).squeeze().cpu().numpy()
-                        label_index = int(np.argmax(probabilities))
-                        segment.emotion = TARGET[label_index]
-                        segment.emotion_confidence = float(probabilities[label_index])
-                        segment.emotion_distribution = {
-                            TARGET[i]: float(probabilities[i])
-                            for i in range(len(TARGET))
-                        }
+                        segment.emotion = result["emotion"]
+                        segment.emotion_confidence = float(result["confidence"])
+                        segment.emotion_distribution = result["probs"]
                         emotion_counts[segment.emotion] += 1
                         progress.progress((index + 1) / len(segments))
 

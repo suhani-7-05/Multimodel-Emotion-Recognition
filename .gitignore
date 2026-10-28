@@ -33,3 +33,5 @@ Thumbs.db
 # Editor / IDE configurations
 .idea/
 .vscode/
+
+prj4_emotion_model.tar.gz
