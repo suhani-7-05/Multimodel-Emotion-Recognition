@@ -1,0 +1,27 @@
+{
+  "text_model": "roberta-large",
+  "audio_model": "microsoft/wavlm-large",
+  "use_audio": true,
+  "audio_shape": [
+    25,
+    2048
+  ],
+  "audio_max_seconds": 15.0,
+  "hidden": 512,
+  "dropout": 0.2,
+  "max_len": 256,
+  "max_history": 12,
+  "max_utt_tokens": 64,
+  "add_prefix_space": true,
+  "temperature": 1.0678846547426293,
+  "emotions": [
+    "neutral",
+    "joy",
+    "surprise",
+    "anger",
+    "sadness",
+    "disgust",
+    "fear"
+  ],
+  "asr_trained": true
+}

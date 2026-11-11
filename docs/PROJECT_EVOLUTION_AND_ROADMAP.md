@@ -21,7 +21,7 @@ For **Project-IV (PRJ4)**, we are taking this project from a flawed, static clas
 ## 2. The Previous Approach (PRJ3 Baseline)
 
 ### Architecture Summary
-* **Code Reference**: [`new.py`](file:///c:/Users/suhan/Desktop/PRJ4/new.py) | **Checkpoint**: [`best3.pt`](file:///c:/Users/suhan/Desktop/PRJ4/best3.pt)
+* **Code Reference**: [`new.py`](../training/new.py) | **Checkpoint**: [`best3.pt`](../training/best3.pt)
 * **Dataset**: MELD (Multimodal Emotion Lines in Dataset), filtered down from 7 emotions to 5 (`neutral`, `joy`, `anger`, `sadness`, `surprise`), discarding `fear` and `disgust`.
 * **Text Pipeline**: `bert-base-uncased` with layers 0–9 frozen and layers 10–11 unfrozen for fine-tuning.
 * **Audio Pipeline**: Librosa extracting **15 static features** (13 MFCCs averaged across time + 1 RMS energy value + 1 zero-padding).
@@ -44,10 +44,10 @@ flowchart LR
 ### Why PRJ3 Failed (The Data from Results)
 When analyzing our result plots, three major flaws emerged:
 
-1. **Severe Mode Collapse ([`RESULTS1.jpeg`](file:///c:/Users/suhan/Desktop/PRJ4/RESULTS1.jpeg))**:
+1. **Severe Mode Collapse ([`RESULTS1.jpeg`](results/RESULTS1.jpeg))**:
    * The confusion matrix shows that the model predicted **`joy` (~50–61%)** and **`anger` (~39–50%)** across every single ground truth class.
    * `neutral`, `sadness`, and `surprise` had an effective prediction rate of **0.00**. Even genuine Neutral dialogues were misclassified as 61% Joy and 39% Anger.
-2. **Per-Class Sensitivity Failure ([`results2.jpeg`](file:///c:/Users/suhan/Desktop/PRJ4/results2.jpeg) & [`results3.jpeg`](file:///c:/Users/suhan/Desktop/PRJ4/results3.jpeg))**:
+2. **Per-Class Sensitivity Failure ([`results2.jpeg`](results/results2.jpeg) & [`results3.jpeg`](results/results3.jpeg))**:
    * Per-class F1 was ~0.25 for Anger, ~0.23 for Joy, ~0.005 for Neutral, and **0.00 for Sadness and Surprise**.
 3. **The "Flattened Audio" Problem**:
    * Averaging MFCCs into 15 numbers stripped out all pitch trajectories, tremors, and voice speed.
