@@ -35,3 +35,12 @@ Thumbs.db
 .vscode/
 
 prj4_emotion_model.tar.gz
+# Frontend
+node_modules/
+frontend/dist/
+
+# Debug capture written by the backend
+debug_capture_16k.wav
+
+# Claude Code local settings
+.claude/

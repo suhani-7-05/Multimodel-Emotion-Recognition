@@ -6,6 +6,10 @@ import sys
 from pathlib import Path
 from collections import Counter
 
+# Pipeline modules now live in backend/.
+BACKEND_DIR = Path(__file__).resolve().parent.parent / "backend"
+sys.path.insert(0, str(BACKEND_DIR))
+
 import librosa
 import numpy as np
 import soundfile as sf
@@ -35,7 +39,7 @@ from diarization_engine import (
 )
 
 # New trained multimodal model bundle. Keep its common2.py isolated from old code.
-MODEL_BUNDLE_DIR = Path(__file__).resolve().parent / "model_bundle"
+MODEL_BUNDLE_DIR = BACKEND_DIR / "model_bundle"
 MODEL_CHECKPOINT_DIR = MODEL_BUNDLE_DIR / "runs" / "v2_rl_audio"
 if not MODEL_CHECKPOINT_DIR.is_dir():
     raise FileNotFoundError(
@@ -80,7 +84,7 @@ def load_whisper_model():
 
 @st.cache_resource
 def load_diarization_engine():
-    return DiarizationEngine.load_models("tmpdir_spkrec")
+    return DiarizationEngine.load_models(str(BACKEND_DIR / "tmpdir_spkrec"))
 
 
 def audio_tensor_to_wav_bytes(audio_tensor, sr=SAMPLE_RATE):
