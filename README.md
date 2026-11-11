@@ -1,71 +1,116 @@
 # Multimodel-Emotion-Recognition
 
-Real-time multimodal emotion recognition with speaker diarization (PRJ4).
-Each utterance is segmented by Silero VAD, assigned to a speaker with ECAPA-TDNN,
-transcribed with Whisper, and classified by a context-aware RoBERTa + WavLM model.
+Real-time conversation interpreter (PRJ4). Each spoken turn is:
+
+1. split off by Silero VAD and given a speaker (ECAPA-TDNN),
+2. transcribed (Whisper large-v3-turbo via faster-whisper),
+3. classified by a context-aware RoBERTa + WavLM model (7 MELD emotions, plus what the
+   words alone and the voice alone suggest, plus simple prosody cues),
+4. explained in plain, literal language by a local LLM: what the speaker means, any
+   sarcasm / hint / indirect request / polite refusal, and whether a reply is expected.
+
+The UI ("Subtext") shows the conversation as a chat with a "What they mean" card under
+every turn, can read explanations aloud, and has a larger-text mode.
 
 ## Layout
 
 ```
 backend/            FastAPI inference server (all models live here)
-  app/              API: main.py (routes), live.py (WebSocket sessions), pipeline.py, models.py
+  app/              main.py (routes), live.py (WebSocket), pipeline.py (per-turn analysis),
+                    asr.py (Whisper + guards), interpreter.py (LLM), models.py, config.py
   audio_capture.py  capture thread, resampling, LiveSession worker
   diarization_engine.py
   model_bundle/     emotion model code (infer2.py, common2.py) + runs/v2_rl_audio weights
+  tools/            convert_whisper_ct2.py (offline Whisper -> faster-whisper conversion)
+  models/           local model folders, not in git (see below)
 frontend/           React + Vite UI (no ML code)
-training/           PRJ3 training script and DGX job files (best3.pt lives here, not in git)
+training/           training script, DGX job files, eval_meld.py
 legacy/             previous Streamlit app and CLI speaker tracker
-docs/               project write-ups and report; docs/results/ holds the PRJ3 result plots
+docs/               write-ups, report, result plots
 ```
 
-`backend/model_bundle/runs/v2_rl_audio/best.pt` is not in git. If it's missing, extract
-`prj4_emotion_model.tar.gz` (kept in `backend/model_bundle/`, also not in git) there.
+Not in git: `backend/model_bundle/runs/v2_rl_audio/best.pt` (extract
+`prj4_emotion_model.tar.gz` there) and `backend/models/`.
 
-## Running
-
-Backend, using the `audio_sentiment` conda env:
+## Running on the laptop
 
 ```bash
 conda activate audio_sentiment
 pip install -r backend/requirements.txt
+python backend/tools/convert_whisper_ct2.py --name large-v3-turbo   # once; uses ~/.cache/whisper/large-v3-turbo.pt
+ollama pull qwen3:4b                                                  # once
 cd backend
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Frontend:
-
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev        # http://localhost:5173 - proxies /api and /ws to :8000
 ```
 
-Open http://localhost:5173 and click **Load models**. The Vite dev server proxies
-`/api` and `/ws` to the backend on port 8000.
+Windows only: faster-whisper needs the CUDA 12 cuBLAS DLLs (`cublas64_12.dll`,
+`cublasLt64_12.dll`) in `backend/models/cuda12/` (copied from any CUDA 12 PyTorch install).
+Without them, or without the converted model, the backend falls back to openai-whisper.
 
-### Backend environment variables
+### Settings (environment variables)
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WHISPER_MODEL` | `large` | Whisper size (`small`, `medium`, … for faster turns) |
-| `PRELOAD_MODELS` | `0` | `1` loads all models at startup |
-| `CORS_ORIGINS` | `http://localhost:5173,...` | Allowed origins when the UI is served from elsewhere |
+| `WHISPER_MODEL` | `backend/models/faster-whisper-large-v3-turbo` if present, else `large-v3-turbo` | ASR model size or local folder |
+| `ASR_ENGINE` | `auto` | `faster`, `openai`, or `auto` (faster-whisper if the model is on disk) |
+| `EMOTION_DEVICE` | `auto` | `cuda` / `cpu`; auto = GPU only if it has >= 12 GB |
+| `LLM_API` | `ollama` | `ollama` or `openai` (vLLM, llama.cpp server, ...) |
+| `LLM_BASE_URL` | `http://127.0.0.1:11434` | LLM server |
+| `LLM_MODEL` | `qwen3:4b` | model name on that server |
+| `LLM_THINK` | `0` | `1` lets reasoning models think first (better, slower) |
+| `LLM_NUM_GPU` | (Ollama decides) | `0` keeps the LLM off a small GPU so Whisper isn't starved |
+| `PRELOAD_MODELS` | `0` | `1` loads everything at startup |
+| `TORCH_THREADS` | torch default | CPU threads for the emotion model |
+
+## Measured on the laptop (RTX 3050 6 GB, 16 threads)
+
+| | Before | Now |
+|---|---|---|
+| ASR, 5 s clip | 5.5 s (Whisper large, spilled past 6 GB VRAM) | 0.4 s (turbo) |
+| Per live turn, all stages | ~10 s (estimate from stages) | ~2.2 s |
+| Per turn from a file | — | ~1.0 s |
+
+Fixes behind this: turbo ASR; speaker / ASR / voice stages run in parallel; Silero VAD was
+silently forcing PyTorch onto 1 CPU thread; VAD in the capture thread no longer competes for
+all cores; warm-up at load time (librosa compiled itself on the first turn, +7 s).
+
+## Evaluation
+
+```bash
+python training/eval_meld.py --data_dir /path/to/MELD.Raw              # gold transcripts
+python training/eval_meld.py --data_dir ... --text live_asr --limit 500  # our ASR, end to end
+python training/eval_meld.py --data_dir ... --no_audio                  # text-only ablation
+```
+
+Writes weighted/macro F1, per-class F1, calibration (ECE) and a confusion matrix to
+`docs/results/eval/`, for the fused model and for the words-only and voice-only heads.
 
 ## API
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/status` | Model state, device, whether a job is running |
+| GET | `/api/status` | Models, device, ASR engine, LLM availability |
 | POST | `/api/models/load` | Start loading models in the background |
-| GET | `/api/config` | Emotion labels and default pipeline settings |
-| GET | `/api/devices` | Microphones available on the server |
-| POST | `/api/batch` | Multipart `file` (+ `speaker_threshold`, `transcript_override`) → analysed segments |
-| GET | `/api/clips/{id}.wav` | Audio of one analysed utterance |
-| WS | `/ws/live` | Live session: see the protocol at the top of `backend/app/live.py` |
+| GET | `/api/config` | Emotion labels and default settings |
+| GET | `/api/devices` | Microphones on the server |
+| POST | `/api/batch` | Multipart `file` (+ VAD/speaker settings) → analysed turns |
+| POST | `/api/interpret` | `{turns, target}` → plain-language explanation of one turn |
+| GET | `/api/clips/{id}.wav` | Audio of one analysed turn |
+| WS | `/ws/live` | Live session (protocol at the top of `backend/app/live.py`) |
 
-Live input can come from the **server microphone** (the machine running the backend,
-recommended) or the **browser microphone**. The browser option sends raw PCM over the
-WebSocket, so it also works when the UI and the backend run on different machines.
+Live input can come from the browser microphone (16 kHz int16 over the WebSocket, ~32 KB/s,
+fine for a remote backend) or the server's own microphone.
 
-Only one live session or batch job runs at a time, because speaker profiles and
-dialogue history are shared model state.
+## Known limitations
+
+- The emotion model is trained on MELD (TV sitcom dialogue); expect lower accuracy on real
+  conversations than on the MELD test set.
+- It reads mostly the words, so sarcastic praise is usually labelled "joy".
+- Small local LLMs (mistral 7B, qwen3:4b) still miss sarcasm that is only signalled by context.
+  A larger model on the GPU server is needed for reliable explanations.

@@ -29,6 +29,7 @@ class DiarizedSegment:
     emotion: str = ""         # Populated by Emotion Model
     emotion_confidence: float = 0.0
     emotion_distribution: dict = None
+    speaker_uncertain: bool = False   # short turn attributed to the nearest known voice
 
 class SpeakerManager:
     """Tracks dynamic speaker centroids using SpeechBrain ECAPA-TDNN 192d embeddings."""
@@ -50,6 +51,32 @@ class SpeakerManager:
             emb = speaker_model.encode_batch(audio_tensor.unsqueeze(0)).squeeze()
             emb = emb / (torch.norm(emb, p=2) + 1e-8)
         return emb
+
+    def nearest(self, emb: torch.Tensor) -> Tuple[Optional[str], float]:
+        """Closest known speaker regardless of the threshold (None if nobody is registered)."""
+        best_speaker, highest_sim = None, -1.0
+        for spk_id, spk_data in self.speakers.items():
+            sim = torch.dot(emb, spk_data["centroid"]).item()
+            if sim > highest_sim:
+                best_speaker, highest_sim = spk_id, sim
+        return best_speaker, highest_sim
+
+    def register_or_update(self, emb: torch.Tensor) -> Tuple[str, float, bool]:
+        """Same decision as identify_or_register, from a precomputed embedding."""
+        best_speaker, highest_sim = self.nearest(emb)
+        if best_speaker is not None and highest_sim >= self.threshold:
+            pool = self.speakers[best_speaker]["embeddings"]
+            pool.append(emb)
+            if len(pool) > 5:
+                pool.pop(0)
+            centroid = torch.stack(pool).mean(dim=0)
+            self.speakers[best_speaker]["centroid"] = centroid / (torch.norm(centroid, p=2) + 1e-8)
+            self.speakers[best_speaker]["count"] += 1
+            return best_speaker, highest_sim, False
+        new_id = f"Speaker {self.speaker_counter}"
+        self.speaker_counter += 1
+        self.speakers[new_id] = {"embeddings": [emb], "centroid": emb, "count": 1}
+        return new_id, (highest_sim if highest_sim != -1.0 else 1.0), True
 
     def identify_existing(self, audio_tensor: torch.Tensor, speaker_model: EncoderClassifier) -> Tuple[Optional[str], float]:
         """Match a clip without registering a speaker or changing any centroid."""
@@ -221,171 +248,97 @@ class DiarizationEngine:
 
     @classmethod
     def load_models(cls, savedir: str = "tmpdir_spkrec"):
-        # 1. Silero VAD v5
-        vad_model, utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            force_reload=False,
-            trust_repo=True
-        )
+        # 1. Silero VAD. The pip package bundles the weights (works offline, e.g. on the
+        #    college pod); torch.hub is only a fallback and needs internet the first time.
+        try:
+            from silero_vad import load_silero_vad
+            vad_model = load_silero_vad()
+        except ImportError:
+            vad_model, _ = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad", model="silero_vad",
+                force_reload=False, trust_repo=True,
+            )
         vad_model.eval()
 
-        # 2. SpeechBrain ECAPA-TDNN (with COPY_SKIP_CACHE for Windows)
+        # 2. SpeechBrain ECAPA-TDNN. If the folder already holds the model, load it from
+        #    disk so no Hugging Face access is needed.
+        from pathlib import Path
+        local = Path(savedir) / "hyperparams.yaml"
         speaker_model = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
+            source=str(Path(savedir).resolve()) if local.is_file() else "speechbrain/spkrec-ecapa-voxceleb",
             savedir=savedir,
-            local_strategy=LocalStrategy.COPY_SKIP_CACHE
+            local_strategy=LocalStrategy.COPY_SKIP_CACHE,
         )
         speaker_model.eval()
-
         return cls(vad_model, speaker_model)
 
+    # ------------------------------------------------------------------ speaker assignment
+    def embed(self, audio_tensor: torch.Tensor) -> torch.Tensor:
+        """ECAPA embedding (the slow part). Thread-safe; can run in parallel with ASR."""
+        return self.speaker_manager._embedding(audio_tensor, self.speaker_model)
 
-    def process_utterance(
-        self,
-        audio_tensor: torch.Tensor,
-        turn_id: int,
-        start_sec: float,
-        end_sec: float,
-    ) -> DiarizedSegment:
+    def assign(self, emb: torch.Tensor, duration_sec: float):
+        """
+        Decide the speaker for one utterance from its embedding.
+        Returns (speaker_id, similarity, is_new, uncertain).
+
+        Short turns (< STREAMING_MIN_SPEAKER_DURATION) give unreliable embeddings, so they
+        never create a speaker or move a centroid. They are attributed to the nearest known
+        voice and flagged uncertain when that voice is below the similarity threshold.
+        """
+        if duration_sec < STREAMING_MIN_SPEAKER_DURATION:
+            nearest, sim = self.speaker_manager.nearest(emb)
+            if nearest is None:
+                return "Unknown", 0.0, False, True
+            return nearest, max(sim, 0.0), False, sim < self.speaker_manager.threshold
+        speaker_id, sim, is_new = self.speaker_manager.register_or_update(emb)
+        return speaker_id, sim, is_new, False
+
+    def process_utterance(self, audio_tensor: torch.Tensor, turn_id: int,
+                          start_sec: float, end_sec: float) -> DiarizedSegment:
         """Assign a speaker to one already-segmented utterance while retaining speaker history."""
         audio_tensor = audio_tensor.detach().float().cpu().flatten()
-        duration = audio_tensor.numel() / SAMPLE_RATE
-        if duration < STREAMING_MIN_SPEAKER_DURATION:
-            # Short/noisy turns may be matched to an existing speaker, but they
-            # must never create a new ID or update a centroid.
-            matched_id, similarity = self.speaker_manager.identify_existing(
-                audio_tensor, self.speaker_model
-            )
-            speaker_id = matched_id or "Unknown"
-            is_new = False
-            similarity = float(similarity if similarity >= 0 else 0.0)
-        else:
-            speaker_id, similarity, is_new = self.speaker_manager.identify_or_register(
-                audio_tensor, self.speaker_model
-            )
+        emb = self.embed(audio_tensor)
+        speaker_id, sim, is_new, uncertain = self.assign(emb, audio_tensor.numel() / SAMPLE_RATE)
         return DiarizedSegment(
-            turn_id=turn_id,
-            speaker_id=speaker_id,
-            start_sec=float(start_sec),
-            end_sec=float(end_sec),
-            audio=audio_tensor,
-            similarity=float(similarity),
-            is_new_speaker=bool(is_new),
+            turn_id=turn_id, speaker_id=speaker_id,
+            start_sec=float(start_sec), end_sec=float(end_sec),
+            audio=audio_tensor, similarity=float(sim),
+            is_new_speaker=bool(is_new), speaker_uncertain=bool(uncertain),
         )
 
-    def process_full_audio(self, audio_data: np.ndarray, sample_rate: int = SAMPLE_RATE) -> List[DiarizedSegment]:
+    # ------------------------------------------------------------------ whole files
+    def segment_full_audio(self, audio_data, threshold: float = VAD_THRESHOLD,
+                           silence_duration: float = SILENCE_DURATION,
+                           min_speech_duration: float = MIN_SPEECH_DURATION):
         """
-        Segments a complete audio recording (e.g. from an uploaded WAV file)
-        into speech utterances using Silero VAD, then diarizes each segment
-        with ECAPA-TDNN.
+        Split a whole recording into utterances with the SAME streaming segmenter the live
+        path uses (same pre-roll/tail, same settings), so a file and a live recording of the
+        same speech produce the same turns. Returns [(audio_tensor, start_sec, end_sec)].
         """
+        audio = audio_data.numpy() if isinstance(audio_data, torch.Tensor) else np.asarray(audio_data)
+        audio = audio.astype(np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=0)
+        seg = StreamingVADSegmenter(self.vad_model, threshold=threshold,
+                                    silence_duration=silence_duration,
+                                    min_speech_duration=min_speech_duration)
+        utterances = []
+        step = SAMPLE_RATE  # feed 1 s at a time, exactly like a live stream
+        for i in range(0, len(audio), step):
+            utterances.extend(seg.push_audio(audio[i:i + step]))
+        utterances.extend(seg.flush())
+        if not utterances and len(audio) / SAMPLE_RATE >= min_speech_duration:
+            # VAD found nothing distinct (very short or quiet file): keep it as one turn.
+            utterances.append((torch.from_numpy(audio), 0.0, len(audio) / SAMPLE_RATE))
+        return utterances
+
+    def process_full_audio(self, audio_data: np.ndarray, sample_rate: int = SAMPLE_RATE,
+                           **segment_kwargs) -> List[DiarizedSegment]:
+        """Segment a whole recording, then diarize every utterance in order (legacy helper)."""
         if sample_rate != SAMPLE_RATE:
-            # Resampling should be handled before or via librosa/torchaudio
-            pass
-
-        if isinstance(audio_data, np.ndarray):
-            audio_tensor = torch.from_numpy(audio_data).float()
-        else:
-            audio_tensor = audio_data.float()
-
-        if audio_tensor.ndim > 1:
-            audio_tensor = audio_tensor.mean(dim=0)  # mono
-
-        total_samples = len(audio_tensor)
-        silence_limit_frames = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE)
-        min_speech_frames = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SIZE)
-
-        segments: List[DiarizedSegment] = []
-        is_speaking = False
-        speech_chunks = []
-        silence_counter = 0
-        current_start_frame = 0
-        frame_idx = 0
-
-        self.vad_model.reset_states()
-
-        for i in range(0, total_samples, CHUNK_SIZE):
-            chunk = audio_tensor[i:i + CHUNK_SIZE]
-            if len(chunk) < CHUNK_SIZE:
-                # Pad last frame if needed
-                chunk = F.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
-
-            with torch.no_grad():
-                prob = self.vad_model(chunk, SAMPLE_RATE).item()
-
-            if prob > VAD_THRESHOLD:
-                if not is_speaking:
-                    is_speaking = True
-                    current_start_frame = frame_idx
-                speech_chunks.append(chunk)
-                silence_counter = 0
-            elif is_speaking:
-                speech_chunks.append(chunk)
-                silence_counter += 1
-
-                if silence_counter > silence_limit_frames:
-                    is_speaking = False
-                    speech_frames_count = len(speech_chunks) - silence_counter
-                    if speech_frames_count >= min_speech_frames:
-                        segment_audio = torch.cat(speech_chunks[:speech_frames_count])
-                        start_sec = (current_start_frame * CHUNK_SIZE) / SAMPLE_RATE
-                        end_sec = start_sec + (len(segment_audio) / SAMPLE_RATE)
-
-                        spk_id, sim, is_new = self.speaker_manager.identify_or_register(
-                            segment_audio, self.speaker_model
-                        )
-
-                        segments.append(DiarizedSegment(
-                            turn_id=len(segments) + 1,
-                            speaker_id=spk_id,
-                            start_sec=start_sec,
-                            end_sec=end_sec,
-                            audio=segment_audio,
-                            similarity=sim,
-                            is_new_speaker=is_new
-                        ))
-
-                    speech_chunks = []
-                    silence_counter = 0
-                    self.vad_model.reset_states()
-
-            frame_idx += 1
-
-        # Check if an ongoing utterance reached the end of the file
-        if is_speaking:
-            speech_frames_count = len(speech_chunks) - silence_counter
-            if speech_frames_count >= min_speech_frames:
-                segment_audio = torch.cat(speech_chunks[:speech_frames_count])
-                start_sec = (current_start_frame * CHUNK_SIZE) / SAMPLE_RATE
-                end_sec = start_sec + (len(segment_audio) / SAMPLE_RATE)
-                spk_id, sim, is_new = self.speaker_manager.identify_or_register(
-                    segment_audio, self.speaker_model
-                )
-                segments.append(DiarizedSegment(
-                    turn_id=len(segments) + 1,
-                    speaker_id=spk_id,
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                    audio=segment_audio,
-                    similarity=sim,
-                    is_new_speaker=is_new
-                ))
-
-        # Fallback: if VAD found no distinct segments (e.g. short audio or low volume),
-        # return the full audio as one segment if longer than min duration
-        if not segments and (total_samples / SAMPLE_RATE) >= MIN_SPEECH_DURATION:
-            spk_id, sim, is_new = self.speaker_manager.identify_or_register(
-                audio_tensor, self.speaker_model
-            )
-            segments.append(DiarizedSegment(
-                turn_id=1,
-                speaker_id=spk_id,
-                start_sec=0.0,
-                end_sec=total_samples / SAMPLE_RATE,
-                audio=audio_tensor,
-                similarity=sim,
-                is_new_speaker=is_new
-            ))
-
-        return segments
+            raise ValueError(f"Resample to {SAMPLE_RATE} Hz first (got {sample_rate}).")
+        return [
+            self.process_utterance(audio, i + 1, start, end)
+            for i, (audio, start, end) in enumerate(self.segment_full_audio(audio_data, **segment_kwargs))
+        ]

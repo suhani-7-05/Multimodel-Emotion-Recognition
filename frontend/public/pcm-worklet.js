@@ -1,10 +1,29 @@
-// Collects mono float32 PCM from the microphone and posts it in ~2048-sample chunks.
-// Runs on the audio rendering thread, so it only copies samples - no processing.
+// Collects mono PCM from the microphone and posts ~100 ms chunks.
+// processorOptions.format: "s16" -> Int16 (compact, for a remote backend) or "f32".
+// Runs on the audio rendering thread, so it only copies/converts samples.
 class PcmCapture extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
-    this.size = 2048;
+    const opts = (options && options.processorOptions) || {};
+    this.format = opts.format === "s16" ? "s16" : "f32";
+    this.size = Math.max(256, Math.round((opts.chunkSeconds || 0.1) * sampleRate));
     this.buf = new Float32Array(this.size);
+    this.len = 0;
+  }
+
+  flush() {
+    let out;
+    if (this.format === "s16") {
+      out = new Int16Array(this.size);
+      for (let i = 0; i < this.size; i++) {
+        const s = Math.max(-1, Math.min(1, this.buf[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+    } else {
+      out = this.buf;
+      this.buf = new Float32Array(this.size);
+    }
+    this.port.postMessage(out.buffer, [out.buffer]);
     this.len = 0;
   }
 
@@ -17,11 +36,7 @@ class PcmCapture extends AudioWorkletProcessor {
         this.buf.set(channel.subarray(i, i + n), this.len);
         this.len += n;
         i += n;
-        if (this.len === this.size) {
-          this.port.postMessage(this.buf.buffer, [this.buf.buffer]);
-          this.buf = new Float32Array(this.size);
-          this.len = 0;
-        }
+        if (this.len === this.size) this.flush();
       }
     }
     return true;

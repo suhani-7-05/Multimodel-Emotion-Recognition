@@ -241,6 +241,8 @@ class LiveSession:
         self.peak = 0.0
         self.clipped_samples = 0
         self.dropped_utterances = 0
+        self.level = 0.0          # RMS of the most recent audio block (for a level meter)
+        self.analyzing = False    # the worker is busy with an utterance right now
 
         self._capture = threading.Thread(target=self._capture_loop, name="capture", daemon=True)
         self._worker = threading.Thread(target=self._worker_loop, name="inference", daemon=True)
@@ -289,6 +291,9 @@ class LiveSession:
             "gap_ms": self.resampler.gap_ms,
             "pending": self.work_q.qsize(),
             "dropped_utterances": self.dropped_utterances,
+            "level": self.level,
+            "speaking": bool(getattr(self.segmenter, "is_speaking", False)),
+            "analyzing": self.analyzing,
         }
         if self._extra_stats is not None:
             try:
@@ -305,6 +310,15 @@ class LiveSession:
     def _capture_loop(self):
         wav = None
         try:
+            # Silero VAD runs ~31 tiny inferences per second here. With the default
+            # multi-threaded intra-op pool each one wakes every core, which starved the
+            # analysis worker (live turns took ~2.5 s instead of ~1 s). The setting is
+            # per-thread, so this only affects the capture thread.
+            try:
+                import torch
+                torch.set_num_threads(1)
+            except Exception:
+                pass
             if self._debug_wav_path:
                 import soundfile as sf
 
@@ -346,6 +360,7 @@ class LiveSession:
             return
         self.audio_samples += audio.size
         self.peak = max(self.peak, float(np.max(np.abs(audio))))
+        self.level = float(np.sqrt(np.mean(audio[-1600:] ** 2)))
         self.clipped_samples += int(np.count_nonzero(np.abs(audio) >= 0.999))
         if wav is not None:
             wav.write(audio)
@@ -375,6 +390,7 @@ class LiveSession:
                 if item is None:
                     return
                 audio, start_sec, end_sec, turn_id = item
+                self.analyzing = True
                 segment = self._analyze(audio, start_sec, end_sec, turn_id)
                 self.result_q.put({"ok": True, "segment": segment})
             except Exception as exc:
@@ -384,4 +400,5 @@ class LiveSession:
                     "turn_id": item[3] if item else None,
                 })
             finally:
+                self.analyzing = False
                 self.work_q.task_done()

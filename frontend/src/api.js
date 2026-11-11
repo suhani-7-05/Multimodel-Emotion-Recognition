@@ -4,7 +4,7 @@ async function request(path, options) {
     let detail = `${res.status} ${res.statusText}`;
     try {
       const body = await res.json();
-      if (body.detail) detail = body.detail;
+      if (body.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
     } catch {
       /* not JSON */
     }
@@ -18,13 +18,19 @@ export const api = {
   config: () => request("/api/config"),
   loadModels: () => request("/api/models/load", { method: "POST" }),
   devices: () => request("/api/devices"),
-  batch: (file, settings, transcriptOverride) => {
+  batch: (file, settings) => {
     const form = new FormData();
     form.append("file", file);
-    form.append("speaker_threshold", String(settings.speaker_threshold));
-    if (transcriptOverride) form.append("transcript_override", transcriptOverride);
+    for (const [k, v] of Object.entries(settings)) form.append(k, String(v));
     return request("/api/batch", { method: "POST", body: form });
   },
+  interpret: (turns, target, signal) =>
+    request("/api/interpret", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ turns, target }),
+      signal,
+    }),
 };
 
 export function liveSocketUrl() {

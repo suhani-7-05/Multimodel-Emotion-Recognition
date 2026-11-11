@@ -32,7 +32,7 @@ LLM_AFFECT_PREAMBLE = (
 
 class EmotionContextEngine:
     def __init__(self, ckpt_dir: str, device: Optional[str] = None, audio_model: Optional[str] = None,
-                 audio_fp16: bool = False):
+                 audio_fp16: bool = False, text_fp16: bool = False):
         from transformers import AutoConfig, AutoTokenizer
 
         ckpt = Path(ckpt_dir)
@@ -49,6 +49,7 @@ class EmotionContextEngine:
         self.model.load_state_dict(torch.load(ckpt / "best.pt", map_location="cpu"))
         self.model.to(self.device).eval()
         self.temperature = float(self.cfg.get("temperature", 1.0))
+        self.text_fp16 = text_fp16 and self.device.type == "cuda"
         self.audio = None
         if self.cfg["use_audio"]:
             self.audio = AudioFeatureExtractor(audio_model or self.cfg["audio_model"], str(self.device),
@@ -70,10 +71,21 @@ class EmotionContextEngine:
 
     # ------------------------------------------------------------------ prediction
     @torch.no_grad()
+    def audio_features(self, audio: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """WavLM features for one utterance. Independent of the transcript and the history, so
+        callers can run it in parallel with ASR and pass the result to update(audio_feats=...)."""
+        if self.audio is None or audio is None or len(audio) == 0:
+            return None
+        return self.audio(prepare_waveform(audio, self.cfg.get("audio_max_seconds", 15.0)))
+
+    @torch.no_grad()
     def update(self, speaker: str, text: str, audio: Optional[np.ndarray] = None,
-               commit: bool = True) -> Dict:
+               commit: bool = True, audio_feats: Optional[np.ndarray] = None) -> Dict:
         """Classify one finished utterance given everything said before it, then (optionally) add it
-        to the history. `audio` = mono float32 waveform @16 kHz of exactly this utterance (or None)."""
+        to the history. `audio` = mono float32 waveform @16 kHz of exactly this utterance (or None).
+        `audio_feats` = precomputed audio_features(audio); takes precedence over `audio`."""
+        if audio_feats is None:
+            audio_feats = self.audio_features(audio)
         text = clean_text(text)
         spk = self._spk(speaker)
         ids = self.builder.encode_text(text)
@@ -84,14 +96,18 @@ class EmotionContextEngine:
         tmask[0, ts:te] = True
 
         audio_t, ok = None, None
-        if self.audio is not None and audio is not None and len(audio) > 0:
-            feats = self.audio(prepare_waveform(audio, self.cfg.get("audio_max_seconds", 15.0)))
-            audio_t = torch.from_numpy(feats).float().unsqueeze(0).to(self.device)
+        if audio_feats is not None:
+            audio_t = torch.from_numpy(audio_feats).float().unsqueeze(0).to(self.device)
             ok = torch.ones(1, dtype=torch.bool, device=self.device)
 
-        out = self.model(x, attn, tmask, audio_t, ok)
+        with torch.autocast(self.device.type, dtype=torch.float16, enabled=self.text_fp16):
+            out = self.model(x, attn, tmask, audio_t, ok)
         probs = softmax_np(out["emo"].float().cpu().numpy()[0] / self.temperature)
         sent = softmax_np(out["sent"].float().cpu().numpy()[0])
+        # Auxiliary single-modality heads: what the words alone / the voice alone suggest.
+        text_probs = softmax_np(out["text"].float().cpu().numpy()[0])
+        audio_probs = (softmax_np(out["audio"].float().cpu().numpy()[0])
+                       if out.get("audio") is not None else None)
         order = np.argsort(-probs)
         result = {
             "speaker": speaker, "text": text,
@@ -101,6 +117,9 @@ class EmotionContextEngine:
             "sentiment": {s: float(p) for s, p in zip(SENTIMENTS, sent)},
             "tone": SENTIMENTS[int(sent.argmax())],
             "audio_used": audio_t is not None,
+            "text_probs": {e: float(p) for e, p in zip(EMOTIONS, text_probs)},
+            "audio_probs": ({e: float(p) for e, p in zip(EMOTIONS, audio_probs)}
+                            if audio_probs is not None else None),
         }
         if commit:
             self._hist.append((spk, ids))

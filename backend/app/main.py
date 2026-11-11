@@ -8,17 +8,18 @@ import io
 import logging
 from collections import Counter
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Dict, List, Optional
 
-import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from . import config
+from .interpreter import interpreter
 from .live import run_live_session
 from .models import registry
-from .pipeline import classify, clips, segment_to_dict
+from .pipeline import Conversation, analyze_utterance, clips, segment_to_dict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -30,7 +31,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="PRJ4 Emotion Recognition API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="PRJ4 Emotion Recognition API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
@@ -46,7 +47,7 @@ def status():
         server_mic = True
     except Exception:
         server_mic = False
-    return {**registry.status(), "server_mic_available": server_mic}
+    return {**registry.status(), "server_mic_available": server_mic, "llm": interpreter.status()}
 
 
 @app.get("/api/config")
@@ -80,10 +81,12 @@ def get_clip(clip_id: str):
 @app.post("/api/batch")
 def batch_analysis(
     file: UploadFile = File(...),
+    vad_threshold: float = Form(config.DEFAULT_SETTINGS["vad_threshold"]),
+    silence_duration: float = Form(config.DEFAULT_SETTINGS["silence_duration"]),
+    min_speech_duration: float = Form(config.DEFAULT_SETTINGS["min_speech_duration"]),
     speaker_threshold: float = Form(config.DEFAULT_SETTINGS["speaker_threshold"]),
-    transcript_override: Optional[str] = Form(None),
 ):
-    """Whole-file workflow: VAD-segment, diarize, transcribe and classify an uploaded recording."""
+    """Whole-file workflow. Uses the same segmenter and per-turn pipeline as live mode."""
     import librosa
 
     if not registry.ready:
@@ -99,14 +102,15 @@ def batch_analysis(
         except Exception as exc:
             raise HTTPException(400, f"Could not decode audio: {type(exc).__name__}: {exc}")
         registry.reset_conversation(speaker_threshold)
-        segments = registry.diarizer.process_full_audio(audio, sample_rate=config.SAMPLE_RATE)
-        override = (transcript_override or "").strip()
-        results = []
-        for segment in segments:
-            audio_np = segment.audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
-            transcript = override if (override and len(segments) == 1) else None
-            classify(segment, audio_np, registry, transcript=transcript)
-            results.append(segment_to_dict(segment))
+        utterances = registry.diarizer.segment_full_audio(
+            audio, threshold=vad_threshold, silence_duration=silence_duration,
+            min_speech_duration=min_speech_duration,
+        )
+        conv = Conversation()
+        results = [
+            segment_to_dict(analyze_utterance(utt, i + 1, start, end, registry, conv))
+            for i, (utt, start, end) in enumerate(utterances)
+        ]
         counts = Counter(r["emotion"] for r in results)
         return {
             "duration_sec": round(len(audio) / config.SAMPLE_RATE, 2),
@@ -116,6 +120,24 @@ def batch_analysis(
         }
     finally:
         registry.release()
+
+
+class InterpretRequest(BaseModel):
+    turns: List[Dict]
+    target: Optional[int] = None
+
+
+@app.post("/api/interpret")
+def interpret(req: InterpretRequest):
+    """Plain-language explanation of one turn, given the turns before it (stateless)."""
+    try:
+        return interpreter.interpret(req.turns, req.target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, f"Interpreter failed: {type(exc).__name__}: {exc}")
 
 
 @app.websocket("/ws/live")

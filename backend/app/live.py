@@ -3,13 +3,15 @@ Live sessions over a single WebSocket (/ws/live).
 
 Client -> server
     {"type": "start", "source": "server" | "browser", "device": int | null,
-     "sample_rate": int (browser only), "settings": {...}, "debug_wav": bool}
-    binary frames: mono float32 PCM at `sample_rate`   (browser source only)
+     "sample_rate": int, "format": "f32" | "s16" (browser only),
+     "settings": {...}, "debug_wav": bool}
+    binary frames: mono PCM at `sample_rate` in `format`   (browser source only;
+                   the UI sends 16 kHz int16 = 32 KB/s, small enough for a remote backend)
     {"type": "stop"}
 
 Server -> client
     {"type": "started", "source_info": str, "settings": {...}}
-    {"type": "stats", ...capture health...}            (about once a second)
+    {"type": "stats", ...capture health, level, speaking...}   (4x a second)
     {"type": "segment", "segment": {...}}              (one per analysed utterance)
     {"type": "error", "message": str}
     {"type": "stopping"}  then  {"type": "stopped"}
@@ -29,7 +31,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from . import config
 from .models import registry
-from .pipeline import analyze_utterance, segment_to_dict
+from .pipeline import Conversation, analyze_utterance, segment_to_dict
 
 LOG = logging.getLogger("live")
 
@@ -37,8 +39,9 @@ LOG = logging.getLogger("live")
 class BrowserSource:
     """Raw PCM pushed by the browser over the WebSocket - no WebRTC, no Opus."""
 
-    def __init__(self, rate: int):
+    def __init__(self, rate: int, fmt: str = "f32"):
         self.rate = int(rate)
+        self.fmt = fmt if fmt in ("f32", "s16") else "f32"
         self.dropped_blocks = 0
         self._closed = False
         self._q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2000)
@@ -46,7 +49,10 @@ class BrowserSource:
     def push(self, data: bytes):
         if self._closed or len(data) < 4:
             return
-        block = np.frombuffer(data[: len(data) - len(data) % 4], dtype=np.float32).copy()
+        if self.fmt == "s16":
+            block = np.frombuffer(data[: len(data) - len(data) % 2], dtype="<i2").astype(np.float32) / 32768.0
+        else:
+            block = np.frombuffer(data[: len(data) - len(data) % 4], dtype="<f4").copy()
         try:
             self._q.put_nowait(block)
         except queue.Full:
@@ -131,8 +137,8 @@ async def run_live_session(ws: WebSocket):
         browser = start.get("source") == "browser"
         try:
             if browser:
-                source = BrowserSource(int(start.get("sample_rate") or 48000))
-                info = f"Browser microphone (raw PCM @ {source.rate} Hz)"
+                source = BrowserSource(int(start.get("sample_rate") or 48000), start.get("format", "f32"))
+                info = f"Browser microphone ({source.fmt} PCM @ {source.rate} Hz)"
             else:
                 device = start.get("device")
                 source = SoundDeviceSource(None if device is None else int(device))
@@ -155,8 +161,10 @@ async def run_live_session(ws: WebSocket):
             min_speech_duration=settings["min_speech_duration"],
         )
 
+        conv = Conversation()
+
         def analyze(audio, start_sec, end_sec, turn_id):
-            return analyze_utterance(audio, turn_id, start_sec, end_sec, registry)
+            return analyze_utterance(audio, turn_id, start_sec, end_sec, registry, conv)
 
         session = LiveSession(
             source.pull, segmenter, analyze,
@@ -195,7 +203,7 @@ async def run_live_session(ws: WebSocket):
         while not stop_requested.is_set() and session.running:
             await _flush(client, session)
             now = time.monotonic()
-            if now - last_stats >= 1.0:
+            if now - last_stats >= 0.25:
                 last_stats = now
                 await client.send({"type": "stats", "source_info": info, **session.snapshot()})
             try:
