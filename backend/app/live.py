@@ -7,6 +7,9 @@ Client -> server
      "settings": {...}, "debug_wav": bool}
     binary frames: mono PCM at `sample_rate` in `format`   (browser source only;
                    the UI sends 16 kHz int16 = 32 KB/s, small enough for a remote backend)
+    {"type": "cut", "reset_context": bool}   (browser source only) the stream jumps here
+                   (e.g. a video seek): drop the half-finished utterance at this point and,
+                   if reset_context, start a fresh dialogue context (speakers are kept)
     {"type": "stop"}
 
 Server -> client
@@ -36,6 +39,15 @@ from .pipeline import Conversation, analyze_utterance, segment_to_dict
 LOG = logging.getLogger("live")
 
 
+class Cut:
+    """Marker travelling through the audio queue, so a cut lands exactly between the audio
+    sent before it and the audio sent after it."""
+    cut = True
+
+    def __init__(self, reset_context: bool):
+        self.reset_context = reset_context
+
+
 class BrowserSource:
     """Raw PCM pushed by the browser over the WebSocket - no WebRTC, no Opus."""
 
@@ -58,17 +70,32 @@ class BrowserSource:
         except queue.Full:
             self.dropped_blocks += 1
 
+    def push_cut(self, reset_context: bool):
+        if not self._closed:
+            self._q.put(Cut(reset_context))
+
     def stop(self):
         self._closed = True
 
     def pull(self, timeout: float):
-        blocks = [self._q.get(timeout=timeout)]  # raises queue.Empty on timeout
-        while len(blocks) < 128:
+        """Up to 128 queued items, audio blocks merged, Cut markers kept in order."""
+        item = self._q.get(timeout=timeout)  # raises queue.Empty on timeout
+        out, blocks = [], []
+        for _ in range(128):
+            if isinstance(item, Cut):
+                if blocks:
+                    out.append((np.concatenate(blocks), self.rate))
+                    blocks = []
+                out.append(item)
+            else:
+                blocks.append(item)
             try:
-                blocks.append(self._q.get_nowait())
+                item = self._q.get_nowait()
             except queue.Empty:
                 break
-        return [(np.concatenate(blocks), self.rate)]
+        if blocks:
+            out.append((np.concatenate(blocks), self.rate))
+        return out
 
     def stats(self) -> Dict:
         return {"overflows": 0, "dropped_blocks": self.dropped_blocks}
@@ -138,7 +165,8 @@ async def run_live_session(ws: WebSocket):
         try:
             if browser:
                 source = BrowserSource(int(start.get("sample_rate") or 48000), start.get("format", "f32"))
-                info = f"Browser microphone ({source.fmt} PCM @ {source.rate} Hz)"
+                label = str(start.get("label") or "Browser microphone")[:60]
+                info = f"{label} ({source.fmt} PCM @ {source.rate} Hz)"
             else:
                 device = start.get("device")
                 source = SoundDeviceSource(None if device is None else int(device))
@@ -161,14 +189,20 @@ async def run_live_session(ws: WebSocket):
             min_speech_duration=settings["min_speech_duration"],
         )
 
-        conv = Conversation()
+        conv = [Conversation()]
 
         def analyze(audio, start_sec, end_sec, turn_id):
-            return analyze_utterance(audio, turn_id, start_sec, end_sec, registry, conv)
+            return analyze_utterance(audio, turn_id, start_sec, end_sec, registry, conv[0])
+
+        def reset_context():
+            # Runs on the analysis worker, after every utterance from before the cut.
+            registry.emotion.reset()
+            registry.asr.reset()
+            conv[0] = Conversation()
 
         session = LiveSession(
             source.pull, segmenter, analyze,
-            on_close=source.stop, extra_stats=source.stats,
+            on_close=source.stop, extra_stats=source.stats, on_context_reset=reset_context,
             debug_wav_path=str(config.DEBUG_WAV_PATH) if start.get("debug_wav") else None,
         )
         session.start()
@@ -193,6 +227,8 @@ async def run_live_session(ws: WebSocket):
                             continue
                         if data.get("type") == "stop":
                             break
+                        if data.get("type") == "cut" and browser:
+                            source.push_cut(bool(data.get("reset_context", True)))
             except (WebSocketDisconnect, RuntimeError):
                 client.connected = False
             finally:

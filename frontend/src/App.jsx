@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api.js";
 import { useLiveSession } from "./hooks/useLiveSession.js";
+import { useWatchSession } from "./hooks/useWatchSession.js";
 import { useInterpreter } from "./hooks/useInterpreter.js";
 import { interpretationSpeech, speak } from "./lib/speech.js";
 import Conversation from "./components/Conversation.jsx";
@@ -8,12 +9,13 @@ import Insights from "./components/Insights.jsx";
 import SessionCard from "./components/SessionCard.jsx";
 import SettingsDrawer from "./components/SettingsDrawer.jsx";
 import UploadCard from "./components/UploadCard.jsx";
+import WatchView from "./components/WatchView.jsx";
 import { GearIcon, TextSizeIcon } from "./components/Icons.jsx";
 
 export const APP_NAME = "Subtext";
 
 const DEFAULT_SETTINGS = { vad_threshold: 0.5, silence_duration: 1.1, min_speech_duration: 0.6, speaker_threshold: 0.38 };
-const DEFAULT_PREFS = { source: "browser", device: null, explain: true, autoSpeak: false, onlySubtext: true, debugWav: false, easyRead: false };
+const DEFAULT_PREFS = { source: "browser", device: null, explain: true, autoSpeak: false, onlySubtext: true, pauseOnSubtext: true, debugWav: false, easyRead: false };
 
 function loadPrefs() {
   try {
@@ -121,6 +123,11 @@ export default function App() {
   const uploadSegments = upload.result?.segments || [];
   const uploadInterp = useInterpreter(uploadSegments, { enabled: prefs.explain && llmOk });
 
+  const [watchSegments, setWatchSegments] = useState([]);
+  const watch = useWatchSession({ onSegment: (seg) => setWatchSegments((s) => [...s, seg]) });
+  const watchInterp = useInterpreter(watchSegments, { enabled: prefs.explain && llmOk });
+  const busy = live.status !== "idle" || watch.status !== "idle";
+
   const loadModels = async () => {
     try { setStatus({ ...(await api.loadModels()), llm: status?.llm }); } catch { /* status poll shows it */ }
   };
@@ -159,6 +166,7 @@ export default function App() {
         <nav className="segmented" aria-label="Mode">
           <button className={mode === "live" ? "on" : ""} onClick={() => setMode("live")}>Live</button>
           <button className={mode === "upload" ? "on" : ""} onClick={() => setMode("upload")}>Recording</button>
+          <button className={mode === "watch" ? "on" : ""} onClick={() => setMode("watch")}>Watch</button>
         </nav>
         <div className="topbar-right">
           <StatusPill status={status} error={backendError} onLoad={loadModels} />
@@ -170,7 +178,20 @@ export default function App() {
         </div>
       </header>
 
-      <div className="layout">
+      <div className="layout" hidden={mode !== "watch"}>
+        <WatchView
+          watch={watch}
+          segments={watchSegments}
+          interp={watchInterp}
+          settings={settings}
+          prefs={prefs}
+          setPrefs={setPrefs}
+          ready={ready && live.status === "idle"}
+          onNewVideo={() => { setWatchSegments([]); watchInterp.reset(); watch.reset(); }}
+        />
+      </div>
+
+      <div className="layout" hidden={mode === "watch"}>
         <main className="stream">
           <Conversation
             segments={segments}
@@ -190,12 +211,12 @@ export default function App() {
           {mode === "live" ? (
             <SessionCard
               live={live}
-              ready={ready}
+              ready={ready && watch.status === "idle"}
               onStart={startLive}
               sourceLabel={prefs.source === "browser" ? "Using this browser’s microphone" : "Using the server’s microphone"}
             />
           ) : (
-            <UploadCard ready={ready && live.status === "idle"} running={upload.running} onRun={runUpload} error={upload.error} summary={upload.result} />
+            <UploadCard ready={ready && !busy} running={upload.running} onRun={runUpload} error={upload.error} summary={upload.result} />
           )}
           <Insights segments={segments} interpretations={interp.results} />
           {segments.length > 0 && !(mode === "live" && live.status !== "idle") && (
@@ -217,7 +238,7 @@ export default function App() {
         setSettings={setSettings}
         prefs={prefs}
         setPrefs={setPrefs}
-        locked={live.status !== "idle"}
+        locked={busy}
         status={status}
       />
     </div>

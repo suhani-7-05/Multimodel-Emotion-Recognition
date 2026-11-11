@@ -110,16 +110,20 @@ function Interpretation({ state, onRetry }) {
   );
 }
 
-function Turn({ seg, style, interp, onRetry }) {
+function Turn({ seg, style, interp, onRetry, time, onSelect, active }) {
   const [open, setOpen] = useState(false);
   const mm = mismatch(seg);
   return (
-    <li className={`turn side-${style.side}`} style={{ "--spk": style.color }}>
+    <li className={`turn side-${style.side} ${active ? "active" : ""}`} style={{ "--spk": style.color }}>
       <div className="avatar" aria-hidden>{initials(seg.speaker_id)}</div>
       <div className="turn-body">
         <div className="turn-meta">
           <strong>{seg.speaker_id}{seg.speaker_uncertain && <span className="muted" title="Short turn: speaker is a best guess"> ?</span>}</strong>
-          <span className="muted">{fmtTime(seg.start_sec)}</span>
+          {onSelect ? (
+            <button className="time-link" onClick={() => onSelect(seg)} title="Play this line in the video">▶ {fmtTime(time)}</button>
+          ) : (
+            <span className="muted">{fmtTime(time)}</span>
+          )}
         </div>
         <div className="bubble">
           <p className="transcript">{seg.transcript}</p>
@@ -148,31 +152,42 @@ function fmtTime(s) {
   return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 }
 
-export default function Conversation({ segments, interpretations, onRetry, pendingLabel, empty }) {
+/**
+ * timeOf(seg)   - seconds shown next to the speaker (default: stream time)
+ * onSelect(seg) - makes that time a button (Watch mode: jump the video there)
+ * newestFirst   - newest turn at the top and no auto-scroll (Watch mode keeps the video in view)
+ * activeKey     - audio_url of the turn to highlight
+ */
+export default function Conversation({ segments, interpretations, onRetry, pendingLabel, empty,
+                                       timeOf = (s) => s.start_sec, onSelect, newestFirst = false, activeKey }) {
   const styles = speakerStyles(segments);
   const endRef = useRef(null);
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [segments.length, pendingLabel]);
+    if (!newestFirst) endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [segments.length, pendingLabel, newestFirst]);
 
   if (!segments.length && !pendingLabel) return empty;
+  const pending = pendingLabel && (
+    <li className="turn pending" aria-live="polite">
+      <div className="avatar" aria-hidden>…</div>
+      <div className="bubble pending-bubble"><span className="dots"><i /><i /><i /></span> {pendingLabel}</div>
+    </li>
+  );
+  const turns = segments.map((seg) => (
+    <Turn
+      key={seg.audio_url}
+      seg={seg}
+      style={styles[seg.speaker_id]}
+      interp={interpretations[seg.audio_url]}
+      onRetry={() => onRetry(seg.audio_url)}
+      time={timeOf(seg)}
+      onSelect={onSelect}
+      active={seg.audio_url === activeKey}
+    />
+  ));
   return (
     <ol className="conversation" aria-label="Conversation">
-      {segments.map((seg) => (
-        <Turn
-          key={seg.audio_url}
-          seg={seg}
-          style={styles[seg.speaker_id]}
-          interp={interpretations[seg.audio_url]}
-          onRetry={() => onRetry(seg.audio_url)}
-        />
-      ))}
-      {pendingLabel && (
-        <li className="turn pending" aria-live="polite">
-          <div className="avatar" aria-hidden>…</div>
-          <div className="bubble pending-bubble"><span className="dots"><i /><i /><i /></span> {pendingLabel}</div>
-        </li>
-      )}
+      {newestFirst ? <>{pending}{turns.reverse()}</> : <>{turns}{pending}</>}
       <li ref={endRef} className="end-anchor" aria-hidden />
     </ol>
   );

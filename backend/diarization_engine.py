@@ -161,6 +161,10 @@ class StreamingVADSegmenter:
         self.preroll.clear()
         self.vad_model.reset_states()
 
+    def drop_partial(self):
+        """Discard a half-finished utterance (stream discontinuity) but keep the timeline."""
+        self._clear_utterance()
+
     def reset(self):
         self.pending = np.empty(0, dtype=np.float32)
         self.preroll = deque(maxlen=self.preroll_frames)

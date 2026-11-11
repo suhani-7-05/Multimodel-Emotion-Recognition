@@ -27,6 +27,7 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 LOG = logging.getLogger("audio_capture")
+_CONTEXT_RESET = object()  # work-queue marker: start a fresh dialogue context
 
 
 # --------------------------------------------------------------------------- #
@@ -220,6 +221,7 @@ class LiveSession:
         *,
         on_close: Optional[Callable[[], None]] = None,
         extra_stats: Optional[Callable[[], Dict]] = None,
+        on_context_reset: Optional[Callable[[], None]] = None,
         max_pending: int = 20,
         debug_wav_path: Optional[str] = None,
     ):
@@ -228,6 +230,8 @@ class LiveSession:
         self._analyze = analyze
         self._on_close = on_close
         self._extra_stats = extra_stats
+        self._on_context_reset = on_context_reset
+        self.cuts = 0
         self._debug_wav_path = debug_wav_path
 
         self.resampler = StreamResampler()
@@ -294,6 +298,7 @@ class LiveSession:
             "level": self.level,
             "speaking": bool(getattr(self.segmenter, "is_speaking", False)),
             "analyzing": self.analyzing,
+            "cuts": self.cuts,
         }
         if self._extra_stats is not None:
             try:
@@ -352,8 +357,19 @@ class LiveSession:
             self.work_q.put(None)  # tell the worker to finish and exit
 
     def _ingest(self, item, wav):
+        if getattr(item, "cut", False):
+            self._apply_cut(item)
+            return
         frame = item if isinstance(item, av.AudioFrame) else block_to_frame(*item)
         self._push_audio(self.resampler.process(frame), wav)
+
+    def _apply_cut(self, cut):
+        """The stream jumped (e.g. a video seek): drop the half-finished utterance so audio
+        from both sides of the jump is never glued into one turn. The timeline keeps running."""
+        self.cuts += 1
+        self.segmenter.drop_partial()
+        if getattr(cut, "reset_context", False):
+            self.work_q.put(_CONTEXT_RESET)  # ordered after every utterance before the cut
 
     def _push_audio(self, audio: np.ndarray, wav):
         if audio.size == 0:
@@ -389,6 +405,10 @@ class LiveSession:
             try:
                 if item is None:
                     return
+                if item is _CONTEXT_RESET:
+                    if self._on_context_reset is not None:
+                        self._on_context_reset()
+                    continue
                 audio, start_sec, end_sec, turn_id = item
                 self.analyzing = True
                 segment = self._analyze(audio, start_sec, end_sec, turn_id)

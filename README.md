@@ -10,7 +10,15 @@ Real-time conversation interpreter (PRJ4). Each spoken turn is:
    sarcasm / hint / indirect request / polite refusal, and whether a reply is expected.
 
 The UI ("Subtext") shows the conversation as a chat with a "What they mean" card under
-every turn, can read explanations aloud, and has a larger-text mode.
+every turn, can read explanations aloud, and has a larger-text mode. Three modes:
+
+- **Live** - the microphone.
+- **Recording** - upload an audio file, analysed in one go.
+- **Watch** - open a film/TV clip; it plays normally (picture + sound) while its soundtrack
+  is analysed live. Captions under the video show who spoke, the emotion and the plain
+  meaning; the video can pause automatically on a line with a hidden meaning. The video file
+  never leaves the browser - only its audio is streamed. Rewinding shows earlier results
+  without re-analysing; jumping ahead starts analysing from the new point.
 
 ## Layout
 
@@ -105,12 +113,18 @@ Writes weighted/macro F1, per-class F1, calibration (ECE) and a confusion matrix
 | WS | `/ws/live` | Live session (protocol at the top of `backend/app/live.py`) |
 
 Live input can come from the browser microphone (16 kHz int16 over the WebSocket, ~32 KB/s,
-fine for a remote backend) or the server's own microphone.
+fine for a remote backend), the server's own microphone, or a playing video (Watch mode:
+int16 at the browser's rate, ~96 KB/s; `cut` messages mark seeks so lines from both sides of
+a jump are never merged).
 
 ## Known limitations
 
 - The emotion model is trained on MELD (TV sitcom dialogue); expect lower accuracy on real
   conversations than on the MELD test set.
 - It reads mostly the words, so sarcastic praise is usually labelled "joy".
-- Small local LLMs (mistral 7B, qwen3:4b) still miss sarcasm that is only signalled by context.
+- Small local LLMs (mistral 7B, qwen3:4b) still miss sarcasm that is only signalled by context,
+  and qwen3:4b sometimes labels a line "sarcasm" but still writes the literal meaning.
   A larger model on the GPU server is needed for reliable explanations.
+- Watch mode on the laptop: explanations arrive several seconds after a line, so the
+  auto-pause lands a little after it (exactly on time when rewatching). Background music can
+  be picked up as speech; raise "Speech detection strictness" for music-heavy scenes.

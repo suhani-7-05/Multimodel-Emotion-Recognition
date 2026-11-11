@@ -3,7 +3,7 @@ import { api } from "../api.js";
 import { CloseIcon } from "./Icons.jsx";
 
 const SLIDERS = [
-  { key: "vad_threshold", label: "Speech detection sensitivity", hint: "Higher ignores more background noise.", min: 0.1, max: 0.9, step: 0.05 },
+  { key: "vad_threshold", label: "Speech detection strictness", hint: "Higher ignores more background noise and music.", min: 0.1, max: 0.9, step: 0.05 },
   { key: "silence_duration", label: "Pause that ends a turn", hint: "Seconds of silence before a turn is analysed.", min: 0.5, max: 2.5, step: 0.1, unit: "s" },
   { key: "min_speech_duration", label: "Shortest turn", hint: "Shorter sounds (coughs, clicks) are ignored.", min: 0.3, max: 1.5, step: 0.1, unit: "s" },
   { key: "speaker_threshold", label: "Speaker matching", hint: "Lower merges similar voices into one speaker.", min: 0.2, max: 0.7, step: 0.02 },
@@ -68,6 +68,10 @@ export default function SettingsDrawer({ open, onClose, settings, setSettings, p
           <label className="switch">
             <input type="checkbox" checked={prefs.onlySubtext} onChange={(e) => set({ onlySubtext: e.target.checked })} />
             <span>Only read aloud when there is a hidden meaning</span>
+          </label>
+          <label className="switch">
+            <input type="checkbox" checked={prefs.pauseOnSubtext} onChange={(e) => set({ pauseOnSubtext: e.target.checked })} />
+            <span>Watch mode: pause the video when a line has a hidden meaning</span>
           </label>
           {status?.llm && (
             <p className="muted small">

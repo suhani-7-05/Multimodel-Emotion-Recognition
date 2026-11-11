@@ -26,17 +26,20 @@ SUBTEXT_TYPES = ["none", "sarcasm", "joke", "hint", "indirect_request", "polite_
 
 SCHEMA = {
     "type": "object",
+    # Order matters: structured output is generated in this order, so the model decides on the
+    # hidden meaning BEFORE writing plain_meaning (otherwise it commits to the literal reading
+    # first and can contradict its own "sarcasm" label).
     "properties": {
-        "plain_meaning": {"type": "string"},
-        "feeling": {"type": "string"},
         "subtext": {"type": "string", "enum": SUBTEXT_TYPES},
         "subtext_explanation": {"type": "string"},
+        "plain_meaning": {"type": "string"},
+        "feeling": {"type": "string"},
         "expects_reply": {"type": "boolean"},
         "suggested_reply": {"type": "string"},
         "evidence": {"type": "array", "items": {"type": "string"}},
         "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
     },
-    "required": ["plain_meaning", "feeling", "subtext", "subtext_explanation",
+    "required": ["subtext", "subtext_explanation", "plain_meaning", "feeling",
                  "expects_reply", "suggested_reply", "evidence", "certainty"],
     "additionalProperties": False,
 }
@@ -47,11 +50,12 @@ requests or polite refusals. Your job is to explain the TARGET line in plain, li
 
 Write for clarity:
 - Short sentences. Everyday words. No idioms, metaphors or sarcasm of your own.
-- "plain_meaning": what the speaker most likely means and wants, in at most 30 words.
-  If the line means exactly what it says, restate it simply.
-- "feeling": how the speaker seems to feel, in at most 12 words, hedged ("seems", "probably").
 - "subtext": the kind of hidden meaning, or "none".
 - "subtext_explanation": one or two sentences on what is unsaid and how you can tell. Empty if none.
+- "plain_meaning": what the speaker REALLY means and wants, in at most 30 words. If there is
+  subtext, state the real meaning, never the literal words (sarcastic "I love waiting" means
+  "I hate waiting"). If the line means exactly what it says, restate it simply.
+- "feeling": how the speaker seems to feel, in at most 12 words, hedged ("seems", "probably").
 - "expects_reply": true if the speaker is waiting for an answer or an action.
 - "suggested_reply": a short, kind, literal reply the listener could give. Empty if no reply is needed.
 - "evidence": up to 3 short facts you relied on (words, context, voice cues).
@@ -169,7 +173,8 @@ def build_messages(turns: List[Dict], target: int) -> List[Dict]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for prompt, answer in _EXAMPLES:
         messages.append({"role": "user", "content": prompt})
-        messages.append({"role": "assistant", "content": json.dumps(answer)})
+        ordered = {k: answer[k] for k in SCHEMA["properties"]}  # same key order as the schema
+        messages.append({"role": "assistant", "content": json.dumps(ordered)})
     messages.append({"role": "user", "content": "\n".join(lines)})
     return messages
 
